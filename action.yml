@@ -1,6 +1,6 @@
 name: Setup PostgreSQL and PostGIS for Linux/macOS/Windows
 author: Yuri Astrakhan
-description: Setup PostgreSQL server and install PostGIS extension.
+description: Setup PostgreSQL server with PostGIS and configurable additional extensions.
 branding:
   icon: database
   color: purple
@@ -30,9 +30,28 @@ inputs:
     default: ""
     required: false
   cached-dir:
-    # TODO: move to runner's temp dir, help wanted
     description: Where should the temporary downloads be placed. Used to download and cache PostGIS binary.
-    default: "downloads"
+    default: "${{ runner.temp }}/setup-postgis-downloads"
+    required: false
+  import-schema:
+    description: Import database schema.
+    default: "false"
+    required: false
+  schema-file:
+    description: Path to the SQL schema file to import (relative to workspace or absolute path).
+    default: ""
+    required: false
+  setup-odbc:
+    description: Configure ODBC drivers.
+    default: "false"
+    required: false
+  search-path:
+    description: Default schema search path for database and user.
+    default: ""
+    required: false
+  additional-extensions:
+    description: Comma-separated list of additional PostgreSQL extensions to install (beyond PostGIS).
+    default: ""
     required: false
 outputs:
   connection-uri:
@@ -41,9 +60,36 @@ outputs:
   service-name:
     description: The service name with connection parameters.
     value: ${{ steps.pg.outputs.service-name }}
+  npgsql-connection-string:
+    description: Npgsql connection string with search path.
+    value: "Host=localhost;Port=${{ inputs.port }};Database=${{ inputs.database }};Username=${{ inputs.username }};Password=${{ inputs.password }};Search Path=${{ inputs.search-path }};"
+  odbc-connection-string:
+    description: ODBC connection string.
+    value: "Driver={PostgreSQL ANSI};Servername=localhost;Port=${{ inputs.port }};Database=${{ inputs.database }};Username=${{ inputs.username }};Password=${{ inputs.password }};"
 runs:
   using: composite
   steps:
+    - name: Preflight checks
+      shell: bash
+      id: preflight
+      env:
+        INPUT_PORT: ${{ inputs.port }}
+        INPUT_POSTGRES_VERSION: ${{ inputs.postgres-version }}
+      run: |
+        PORT="$INPUT_PORT"
+        if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" && "$PORT" == '5432' ]]; then
+          echo "::notice::Detected Linux ARM64 runner — default PostgreSQL port 5432 may conflict with system service. Using a custom port (34837)."
+          PORT=34837
+        fi
+        echo "port=$PORT" >> "$GITHUB_OUTPUT"
+    
+        PG_VERSION="$INPUT_POSTGRES_VERSION"
+        if [[ "$RUNNER_OS" == "macOS" && "$PG_VERSION" != "17" ]]; then
+          echo "::notice::On macOS, only postgres-version '17' is supported due to PostGIS Homebrew limitations. Auto-assigning version 17"
+          PG_VERSION=17
+        fi
+        echo "postgres-version=$PG_VERSION" >> "$GITHUB_OUTPUT"  
+        
     - name: Setup PostgreSQL for Linux/macOS/Windows
       id: pg
       uses: ikalnytskyi/action-setup-postgres@v7
@@ -51,8 +97,8 @@ runs:
         username: "${{ inputs.username }}"
         password: "${{ inputs.password }}"
         database: "${{ inputs.database }}"
-        port: "${{ inputs.port }}"
-        postgres-version: "${{ inputs.postgres-version }}"
+        port: "${{ steps.preflight.outputs.port }}"
+        postgres-version: "${{ steps.preflight.outputs.postgres-version }}"
         
     - name: Install PostGIS (Linux)
       if: runner.os == 'Linux'
@@ -73,7 +119,8 @@ runs:
     - name: Install PostGIS on macOS
       if: runner.os == 'macOS'
       shell: bash
-      run: brew install postgis
+      run: |
+        brew install postgis
         
     - name: Detect PostgreSQL Version (Windows)
       if: runner.os == 'Windows'
@@ -187,4 +234,188 @@ runs:
         
     - name: Enable PostGIS extension
       run: psql -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS postgis;' '${{ steps.pg.outputs.connection-uri }}'
+      shell: bash
+    
+    - name: Install additional PostgreSQL extensions
+      if: inputs.additional-extensions != ''
+      run: |
+        # Convert comma-separated list to array and install each extension
+        IFS=',' read -ra EXTENSIONS <<< "${{ inputs.additional-extensions }}"
+        for ext in "${EXTENSIONS[@]}"; do
+          # Trim whitespace
+          ext=$(echo "$ext" | xargs)
+          if [ -n "$ext" ]; then
+            echo "Installing extension: $ext"
+            psql -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS $ext;" '${{ steps.pg.outputs.connection-uri }}'
+          fi
+        done
+      shell: bash
+
+    - name: Configure search path for database and user
+      if: ${{ inputs.search-path != '' }}
+      run: |
+        # Set default schema search_path for the database
+        psql -v ON_ERROR_STOP=1 -c "ALTER DATABASE \"${{ inputs.database }}\" SET search_path TO ${{ inputs.search-path }};" '${{ steps.pg.outputs.connection-uri }}'
+        # Set default schema search_path for the user
+        psql -v ON_ERROR_STOP=1 -c "ALTER ROLE \"${{ inputs.username }}\" SET search_path TO ${{ inputs.search-path }};" '${{ steps.pg.outputs.connection-uri }}'
+      shell: bash
+
+    - name: Setup ODBC drivers (Linux)
+      if: runner.os == 'Linux' && inputs.setup-odbc == 'true'
+      run: |
+        echo "Configuring PostgreSQL ODBC driver..."
+        sudo apt-get update
+        sudo apt-get install -y odbc-postgresql unixodbc unixodbc-dev
+        sudo odbcinst -i -d -f /usr/share/psqlodbc/odbcinst.ini || true
+        
+        # Verify ODBC driver installation
+        if odbcinst -q -d -n "PostgreSQL ANSI"; then
+          echo "PostgreSQL ODBC driver 'PostgreSQL ANSI' is registered"
+        else
+          echo "Warning: PostgreSQL ODBC driver 'PostgreSQL ANSI' not found, checking alternatives..."
+          odbcinst -q -d || true
+        fi
+      shell: bash
+
+    - name: Setup ODBC drivers (Windows)
+      if: runner.os == 'Windows' && inputs.setup-odbc == 'true'
+      shell: pwsh
+      run: |
+        Write-Host "Configuring PostgreSQL ODBC driver on Windows..."
+        
+        $pgVersion = "${{ inputs.postgres-version }}"
+        $cacheDir = "${{ inputs.cached-dir }}"
+        Write-Host "PostgreSQL version: $pgVersion"
+        Write-Host "Cache directory: $cacheDir"
+        
+        # Ensure cache directory exists
+        if (!(Test-Path $cacheDir)) {
+          New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+        }
+        
+        # Download and install PostgreSQL ODBC driver matching PostgreSQL version
+        $odbcUrl = "https://ftp.postgresql.org/pub/odbc/versions/msi/psqlodbc_$($pgVersion)_00_0000-x64.msi"
+        $odbcInstaller = Join-Path $cacheDir "psqlodbc_$($pgVersion)_x64.msi"
+        
+        Write-Host "ODBC driver URL: $odbcUrl"
+        Write-Host "ODBC installer path: $odbcInstaller"
+        
+        try {
+          # Check if ODBC installer is already cached
+          if (Test-Path $odbcInstaller) {
+            Write-Host "Using cached PostgreSQL ODBC driver: $odbcInstaller"
+          } else {
+            Write-Host "Downloading PostgreSQL ODBC driver..."
+            try {
+              # Try version-specific ODBC driver first
+              Invoke-WebRequest -Uri $odbcUrl -OutFile $odbcInstaller -ErrorAction Stop
+              Write-Host "Downloaded version-specific ODBC driver"
+            } catch {
+              Write-Warning "Version-specific ODBC driver not found: $odbcUrl"
+              # Fallback to latest stable version (16.x) with different filename
+              $fallbackUrl = "https://ftp.postgresql.org/pub/odbc/versions/msi/psqlodbc_16_00_0000-x64.msi"
+              $fallbackInstaller = Join-Path $cacheDir "psqlodbc_16_x64_fallback.msi"
+              Write-Host "Falling back to: $fallbackUrl"
+              
+              if (Test-Path $fallbackInstaller) {
+                Write-Host "Using cached fallback ODBC driver: $fallbackInstaller"
+                $odbcInstaller = $fallbackInstaller
+              } else {
+                Invoke-WebRequest -Uri $fallbackUrl -OutFile $fallbackInstaller -ErrorAction Stop
+                $odbcInstaller = $fallbackInstaller
+                Write-Host "Downloaded fallback ODBC driver"
+              }
+            }
+          }
+          
+          Write-Host "Installing PostgreSQL ODBC driver..."
+          Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", $odbcInstaller, "/quiet", "/norestart" -Wait -NoNewWindow
+          
+          Write-Host "PostgreSQL ODBC driver installation completed"
+          
+          # Verify installation by checking registry
+          $odbcDrivers = Get-ItemProperty "HKLM:\SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers" -ErrorAction SilentlyContinue
+          if ($odbcDrivers -and ($odbcDrivers.PSObject.Properties.Name -contains "PostgreSQL ANSI")) {
+            Write-Host "PostgreSQL ODBC driver 'PostgreSQL ANSI' is registered"
+          } else {
+            Write-Warning "PostgreSQL ODBC driver may not be properly registered"
+            # List available drivers for debugging
+            Write-Host "Available ODBC drivers:"
+            Get-OdbcDriver | Where-Object {$_.Name -like "*PostgreSQL*"} | Format-Table Name, Platform -AutoSize
+          }
+          
+        } catch {
+          Write-Warning "Failed to install PostgreSQL ODBC driver: $($_.Exception.Message)"
+          Write-Host "Continuing without ODBC driver installation..."
+        }
+        
+        # Note: ODBC installer files are kept in cache directory for future runs
+
+    - name: Setup ODBC drivers (macOS)
+      if: runner.os == 'macOS' && inputs.setup-odbc == 'true'
+      run: |
+        echo "Configuring PostgreSQL ODBC driver on macOS..."
+        
+        # Install unixODBC and PostgreSQL ODBC driver via Homebrew
+        brew install unixodbc psqlodbc
+        
+        # Verify ODBC driver installation
+        if odbcinst -q -d -n "PostgreSQL ANSI" 2>/dev/null; then
+          echo "PostgreSQL ODBC driver 'PostgreSQL ANSI' is registered"
+        else
+          echo "Warning: PostgreSQL ODBC driver 'PostgreSQL ANSI' not found, checking alternatives..."
+          odbcinst -q -d || true
+        fi
+      shell: bash
+
+    - name: Import database schema
+      if: inputs.import-schema == 'true' && inputs.schema-file != ''
+      run: |
+        SCHEMA_FILE="${{ inputs.schema-file }}"
+        CACHE_DIR="${{ inputs.cached-dir }}"
+        
+        echo "Schema file specified: $SCHEMA_FILE"
+        echo "Cache directory: $CACHE_DIR"
+        
+        # Ensure cache directory exists
+        mkdir -p "$CACHE_DIR"
+        
+        # Determine the final schema file path
+        FINAL_SCHEMA_FILE=""
+        
+        # Check if it's an absolute path
+        if [[ "$SCHEMA_FILE" = /* ]]; then
+          FINAL_SCHEMA_FILE="$SCHEMA_FILE"
+        else
+          # Try relative to workspace first
+          if [ -f "$SCHEMA_FILE" ]; then
+            FINAL_SCHEMA_FILE="$SCHEMA_FILE"
+          # Try in cache directory
+          elif [ -f "$CACHE_DIR/$SCHEMA_FILE" ]; then
+            FINAL_SCHEMA_FILE="$CACHE_DIR/$SCHEMA_FILE"
+            echo "Using cached schema file: $FINAL_SCHEMA_FILE"
+          else
+            echo "Error: Schema file not found: $SCHEMA_FILE"
+            echo "Searched in:"
+            echo "  - $SCHEMA_FILE (relative to workspace)"
+            echo "  - $CACHE_DIR/$SCHEMA_FILE (cached)"
+            echo ""
+            echo "Please provide either:"
+            echo "  - An absolute path to the schema file"
+            echo "  - A relative path from the workspace root"
+            echo "  - Place the file in the cache directory: $CACHE_DIR"
+            exit 1
+          fi
+        fi
+        
+        if [ ! -f "$FINAL_SCHEMA_FILE" ]; then
+          echo "Error: Schema file does not exist: $FINAL_SCHEMA_FILE"
+          exit 1
+        fi
+        
+        echo "Importing database schema from: $FINAL_SCHEMA_FILE"
+        echo "File size: $(du -h "$FINAL_SCHEMA_FILE" | cut -f1)"
+        
+        psql -v ON_ERROR_STOP=1 -f "$FINAL_SCHEMA_FILE" '${{ steps.pg.outputs.connection-uri }}'
+        echo "Database schema import completed successfully"
       shell: bash

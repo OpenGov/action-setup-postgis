@@ -54,7 +54,6 @@ jobs:
         env:
           PGSERVICE: ${{ steps.postgres.outputs.service-name }}
 
-
   parametrized:
     runs-on: ${{ matrix.os }}
     strategy:
